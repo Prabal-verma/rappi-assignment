@@ -151,6 +151,15 @@ BUDGETS = [
 
 
 def _seed_master(session: Session) -> None:
+    """Insert master data parents-first.
+
+    The flush after each group is load-bearing, not decorative. These tables
+    are only linked by ForeignKey columns, with no ORM relationships between
+    them, so SQLAlchemy batches the inserts without a guaranteed ordering
+    between groups. SQLite tolerates that because it does not enforce
+    foreign keys by default; Postgres rejects it outright. Flushing pins the
+    order so the same seed works on both.
+    """
     for sku, name, cat, cost, retail, pack, vol, shelf, perish in PRODUCTS:
         session.add(
             Product(
@@ -158,6 +167,7 @@ def _seed_master(session: Session) -> None:
                 case_pack=pack, unit_volume_m3=vol, shelf_life_days=shelf, is_perishable=perish,
             )
         )
+    session.flush()
     for nid, name, country, city, cap, baseline in NODES:
         session.add(
             Node(
@@ -166,6 +176,7 @@ def _seed_master(session: Session) -> None:
                 review_period_days=7, service_level_target=0.95,
             )
         )
+    session.flush()
     for sid, name, country, lead, fill, ontime, status, reason, split, terms in SUPPLIERS:
         session.add(
             Supplier(
@@ -174,6 +185,7 @@ def _seed_master(session: Session) -> None:
                 status_reason=reason, allows_split_delivery=split, payment_terms_days=terms,
             )
         )
+    session.flush()
     for sid, sku, price, moq, pack, lead, weekly, primary, avail, ratio in SUPPLIER_PRODUCTS:
         session.add(
             SupplierProduct(
@@ -182,11 +194,13 @@ def _seed_master(session: Session) -> None:
                 available_units_override=avail, simulated_fill_ratio=ratio,
             )
         )
+    session.flush()
     for nid, sku, on_hand, reserved in INVENTORY:
         session.add(
             InventoryPosition(sku=sku, node_id=nid, on_hand_units=on_hand, reserved_units=reserved)
         )
 
+    session.flush()
     today = clock.today()
     for nid, cat, allocated, committed, spent in BUDGETS:
         session.add(
@@ -202,6 +216,7 @@ def _seed_master(session: Session) -> None:
 def _seed_demand(session: Session) -> None:
     """Forecast and sales history, generated from a fixed seed."""
     rng = random.Random(RNG_SEED)
+    session.flush()
     today = clock.today()
 
     for node_id, sku, mean, sigma in DEMAND:
@@ -226,6 +241,7 @@ def _seed_demand(session: Session) -> None:
 
 def _seed_scenario_state(session: Session) -> None:
     """The situation each scenario starts from."""
+    session.flush()
     today = clock.today()
     rng = random.Random(RNG_SEED + 1)
 

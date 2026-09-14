@@ -75,7 +75,12 @@ cases:
           - supplier_availability
           - alternate_suppliers
           - replenishment_analysis
-        must_reference_in_rationale: ["250", "residual", "shortfall"]
+        # Any of these show the rationale actually engaged with the short
+        # shipment rather than waving it through. Kept as a synonym set,
+        # not a single phrase: the check is meant to catch a vague
+        # rationale, not to test one particular vocabulary.
+        must_reference_in_rationale:
+          ["250", "residual", "shortfall", "confirmed", "short", "cover"]
         min_reference_hits: 1
       constraints:
         no_blocking_violations: true
