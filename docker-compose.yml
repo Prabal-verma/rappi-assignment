@@ -1,0 +1,56 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: buyer
+      POSTGRES_PASSWORD: buyer
+      POSTGRES_DB: buyer_agent
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buyer -d buyer_agent"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://buyer:buyer@postgres:5432/buyer_agent
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      LLM_MODEL: ${LLM_MODEL:-gemini-2.5-flash}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.0}
+      AGENT_MAX_REPLAN_ATTEMPTS: ${AGENT_MAX_REPLAN_ATTEMPTS:-3}
+      AGENT_MAX_INVESTIGATION_STEPS: ${AGENT_MAX_INVESTIGATION_STEPS:-14}
+      AUTONOMY_AUTO_APPROVE_MAX_VALUE_USD: ${AUTONOMY_AUTO_APPROVE_MAX_VALUE_USD:-5000}
+      AUTONOMY_MAX_DEVIATION_WITHOUT_APPROVAL: ${AUTONOMY_MAX_DEVIATION_WITHOUT_APPROVAL:-0.35}
+      SUPPLIER_SIM_SEED: ${SUPPLIER_SIM_SEED:-42}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      CORS_ORIGINS: http://localhost:5173,http://localhost:3000
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    environment:
+      VITE_API_BASE: http://localhost:8000/api
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+
+volumes:
+  pgdata:
