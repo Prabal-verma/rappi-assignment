@@ -725,25 +725,32 @@ def validate_no_action(
     position genuinely runs out inside the lead time, 'no action' is wrong
     and the agent needs to know that.
     """
-    analysis = calc.analyze_replenishment(session, sku, node_id)
     findings: list[str] = []
     checks = ["C09_LEAD_TIME", "C10_DUPLICATE_COVERAGE"]
     blocking: list[ConstraintViolation] = []
-
-    stockout = analysis.projected_stockout_in_days
 
     # How long the node is genuinely exposed before stock can be replaced.
     # That is the *fastest* supplier who could actually take an order, not
     # the incumbent: a buyer with a one-day emergency source is not exposed
     # for the incumbent's seven days. Using the incumbent here would condemn
     # a correct "no further action" as a stockout risk.
+    #
+    # The requirement is then priced against that same supplier. Mixing the
+    # two bases produces an audit line that contradicts itself — "no action
+    # required, net requirement 302 units" — which is worse than being
+    # wrong, because it is unreadable.
     fastest = session.execute(
-        select(SupplierProduct.lead_time_days)
+        select(SupplierProduct.supplier_id, SupplierProduct.lead_time_days)
         .join(Supplier, Supplier.supplier_id == SupplierProduct.supplier_id)
         .where(SupplierProduct.sku == sku, Supplier.status == "active")
         .order_by(SupplierProduct.lead_time_days)
-    ).scalars().first()
-    lead = fastest if fastest is not None else analysis.lead_time_days
+    ).first()
+
+    analysis = calc.analyze_replenishment(
+        session, sku, node_id, fastest[0] if fastest else None
+    )
+    stockout = analysis.projected_stockout_in_days
+    lead = fastest[1] if fastest else analysis.lead_time_days
     exposure = lead + analysis.review_period_days
 
     if stockout is not None and stockout < exposure:
@@ -778,8 +785,9 @@ def validate_no_action(
 
     findings.append(
         f"No action required: position {analysis.inventory_position_units} units covers "
-        f"{analysis.days_of_cover_now:.1f} days against a {exposure}-day exposure window; "
-        f"net requirement is {analysis.net_requirement_units} units."
+        f"{analysis.days_of_cover_now:.1f} days against a {exposure}-day exposure window "
+        f"(fastest replacement lead time {lead}d + {analysis.review_period_days}d review). "
+        f"Residual requirement on that basis is {analysis.net_requirement_units} units."
     )
     return ValidationReport(
         verdict=ValidationVerdict.PASS,
