@@ -1,0 +1,24 @@
+# ---- web / api ----
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+
+# ---- persistence ----
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3
+
+# ---- agent orchestration ----
+langgraph==0.2.60
+
+# ---- llm transport (provider clients are hand-rolled over httpx) ----
+httpx==0.28.1
+
+# ---- evaluation harness ----
+PyYAML==6.0.2
+rich==13.9.4
+
+# ---- tests ----
+pytest==8.3.4
+pytest-asyncio==0.25.0
