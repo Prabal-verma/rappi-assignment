@@ -162,6 +162,16 @@ class SupplierProduct(Base):
     max_weekly_units: Mapped[int] = mapped_column(Integer, default=100000)
     is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # --- supplier simulator controls -------------------------------
+    # Units the supplier can actually ship right now. None means "no
+    # constraint beyond max_weekly_units". This is what the availability
+    # API reports, and it is the authoritative answer against which an
+    # emailed claim gets corroborated.
+    available_units_override: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Share of an order this supplier will confirm when it is submitted.
+    # 1.0 confirms in full; 0.5 confirms half — the partial-fulfilment case.
+    simulated_fill_ratio: Mapped[float] = mapped_column(Float, default=1.0)
+
 
 class PurchaseOrder(Base):
     __tablename__ = "purchase_orders"
