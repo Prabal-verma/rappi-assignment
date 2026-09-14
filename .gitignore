@@ -1,0 +1,40 @@
+# ---- secrets ----
+.env
+.env.local
+*.key
+*.pem
+secrets/
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# ---- node ----
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+
+# ---- data / runtime ----
+*.db
+*.sqlite3
+backend/data/
+evals/reports/*.json
+evals/reports/*.md
+
+# ---- editors / os ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- assignment source material (not part of the deliverable) ----
+*.pdf
