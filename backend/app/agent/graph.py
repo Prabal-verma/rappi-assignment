@@ -596,10 +596,81 @@ class AgentRunner:
         )
         return {"validation": report.model_dump(mode="json"), "status": f"validated:{report.verdict.value}"}
 
+    def _reobserve(self, state: AgentState) -> list[str]:
+        """Re-read the facts an action can have changed.
+
+        Without this the agent replans against the world as it was before it
+        acted — so it keeps solving a shortfall that its own first order has
+        already partly closed, and orders the same units twice. Re-observing
+        the position, the open orders and the supplier's remaining
+        availability is what a buyer does after a supplier answers, and it
+        is what makes the replan loop converge instead of oscillate.
+        """
+        # Re-price the requirement against the supplier actually being used.
+        # The order-up-to level depends on that supplier's lead time — a
+        # one-day supplier needs far less cover than a seven-day one — so
+        # analysing against the original incumbent after switching sources
+        # produces a residual the constraint engine will disagree with.
+        sourcing_supplier = state.get("supplier_id")
+        for result in reversed(state.get("action_results", [])):
+            supplier = (result.get("action") or {}).get("supplier_id")
+            if supplier:
+                sourcing_supplier = supplier
+                break
+
+        refreshed: list[str] = []
+        plan: list[tuple[str, dict]] = [
+            ("get_inventory_position", {}),
+            ("list_open_purchase_orders", {}),
+            ("analyze_replenishment", {"supplier_id": sourcing_supplier} if sourcing_supplier else {}),
+            ("find_stock_at_other_nodes", {}),
+        ]
+        if state.get("supplier_id"):
+            plan.append(
+                (
+                    "check_supplier_availability",
+                    {
+                        "supplier_id": state["supplier_id"],
+                        "units": state.get("case", {}).get("ordered_units", 0),
+                    },
+                )
+            )
+
+        turns: list[Turn] = state.setdefault("turns", [])
+        for name, args in plan:
+            payload = self._call_tool(state, name, args, "replan")
+            if payload.get("ok"):
+                refreshed.append(name)
+            # The refreshed facts must land in the conversation as well as
+            # the evidence table — the reasoning layer reads the transcript,
+            # so an update that only reaches the table is invisible to it.
+            turns.append(
+                Turn(
+                    role="tool",
+                    content=json.dumps(payload, default=str)[:12000],
+                    tool_call_id=f"reobserve_{name}",
+                    tool_name=name,
+                )
+            )
+        return refreshed
+
     def replan(self, state: AgentState) -> AgentState:
         attempts = state.get("attempts", 0) + 1
         validation = state.get("validation") or {}
         authorization = state.get("authorization") or {}
+
+        refreshed = self._reobserve(state)
+        analysis = state.get("evidence", {}).get("replenishment_analysis", {})
+        if analysis:
+            guidance_prefix = (
+                f"State has been re-read after your action. Inventory position is now "
+                f"{analysis.get('inventory_position_units')} units against a target of "
+                f"{analysis.get('target_position_units')}; the residual requirement is "
+                f"{analysis.get('net_requirement_units')} units. If the residual is zero, the "
+                f"requirement is already covered and ordering more would duplicate cover.\n\n"
+            )
+        else:
+            guidance_prefix = ""
 
         guidance = validation.get("corrective_guidance") or ""
         if not guidance and authorization.get("mode") == "blocked":
@@ -610,22 +681,66 @@ class AgentRunner:
             )
         if validation.get("observed_state"):
             guidance += f"\n\nObserved state after the action: {json.dumps(validation['observed_state'], default=str)}"
+        guidance = guidance_prefix + guidance
 
         self.tracer.step(
             graph_node="replan",
             kind="node",
             title=f"Replanning (attempt {attempts} of {settings.agent_max_replan_attempts})",
-            payload_out={"corrective_guidance": guidance[:4000]},
+            payload_out={
+                "corrective_guidance": guidance[:4000],
+                "refreshed_facts": refreshed,
+                "residual_requirement_units": analysis.get("net_requirement_units"),
+            },
         )
         return {
             "attempts": attempts,
             "corrective_guidance": guidance,
             "status": "replanning",
+            "turns": state.get("turns", []),
+            "evidence": state.get("evidence", {}),
         }
 
     def request_approval(self, state: AgentState) -> AgentState:
         decision = Decision.model_validate(state["decision"])
         authorization = state.get("authorization", {})
+
+        # Show the approver the consequence, not just the quantity. The
+        # post-execution pass still runs after approval — the supplier gets
+        # a say between the two — but nobody should be asked to sign off on
+        # an order whose projected effect has not been checked.
+        preflight = state.get("validation")
+        purchase = next(
+            (
+                a
+                for a in decision.proposed_actions
+                if a.action_type in {ActionType.CREATE_PO, ActionType.MODIFY_PO}
+            ),
+            None,
+        )
+        if purchase is not None:
+            supplier_id = (
+                purchase.supplier_id
+                or self._supplier_for_po(purchase.po_id)
+                or state.get("supplier_id", "")
+            )
+            report = cons.preflight_validate(
+                self.session,
+                sku=purchase.sku or state["sku"],
+                node_id=purchase.node_id or state["node_id"],
+                supplier_id=supplier_id,
+                units=purchase.units or 0,
+                expectation=decision.expectation,
+                replaces_po_id=purchase.po_id,
+            )
+            preflight = report.model_dump(mode="json")
+            self.tracer.step(
+                graph_node="approval",
+                kind="validation",
+                title=f"Pre-flight validation: {report.verdict.value.upper()} — {report.findings[0] if report.findings else ''}"[:256],
+                payload_in={"expectation": decision.expectation.model_dump(mode="json")},
+                payload_out=preflight,
+            )
 
         approval = Approval(
             run_id=self.run_id,
@@ -635,6 +750,7 @@ class AgentRunner:
                 "decision": decision.model_dump(mode="json"),
                 "actions": [a.model_dump(mode="json") for a in decision.proposed_actions],
                 "policy_refs": authorization.get("policy_refs", []),
+                "preflight_validation": preflight,
             },
             risk_level=authorization.get("risk_level", "medium"),
         )
@@ -655,7 +771,7 @@ class AgentRunner:
                 ),
             },
         )
-        return {"status": "awaiting_approval"}
+        return {"status": "awaiting_approval", "validation": preflight or {}}
 
     def finalize(self, state: AgentState) -> AgentState:
         decision = state.get("decision") or {}

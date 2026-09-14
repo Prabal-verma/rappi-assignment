@@ -31,3 +31,21 @@ def freeze(d: date | None) -> None:
     """Pin the clock. Used by tests that assert on absolute dates."""
     global _FROZEN
     _FROZEN = d
+
+
+def as_aware(value: datetime) -> datetime:
+    """Coerce a datetime to UTC-aware.
+
+    SQLite has no timezone type, so SQLAlchemy hands back naive datetimes
+    from columns declared `DateTime(timezone=True)` while Postgres hands
+    back aware ones. Arithmetic that mixes the two raises, which means code
+    that works on Postgres can fail on SQLite and vice versa. Everything
+    that subtracts a stored timestamp goes through here.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def age_in_days(value: datetime) -> int:
+    return (now() - as_aware(value)).days

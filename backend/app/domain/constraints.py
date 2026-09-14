@@ -628,6 +628,94 @@ def validate_purchase_order(
     )
 
 
+def preflight_validate(
+    session: Session,
+    sku: str,
+    node_id: str,
+    supplier_id: str,
+    units: int,
+    expectation: ActionExpectation,
+    replaces_po_id: str | None = None,
+) -> ValidationReport:
+    """Validate a proposal *before* it executes, for the approval queue.
+
+    An approver should not be asked "is this order acceptable?" without
+    being shown what it does. This runs the same constraint engine against
+    the proposed purchase and projects the resulting position, so the human
+    sees the consequence rather than just the quantity. The verdict is
+    provisional — the post-execution pass still runs after approval, because
+    the supplier gets a say between the two.
+    """
+    report = evaluate_purchase(
+        session,
+        ProposedPurchase(
+            sku=sku,
+            node_id=node_id,
+            supplier_id=supplier_id,
+            units=units,
+            replaces_po_id=replaces_po_id,
+        ),
+    )
+    analysis = calc.analyze_replenishment(session, sku, node_id, supplier_id)
+    projected_position = analysis.inventory_position_units + units
+    projected_cover = calc.days_of_cover(projected_position, analysis.daily_demand_mean)
+
+    observed = {
+        "stage": "pre-execution projection",
+        "proposed_units": units,
+        "supplier_id": supplier_id,
+        "current_inventory_position_units": analysis.inventory_position_units,
+        "projected_inventory_position_units": projected_position,
+        "projected_days_of_cover": projected_cover,
+        "target_position_units": analysis.target_position_units,
+        "projected_stockout_in_days": analysis.projected_stockout_in_days,
+        "estimated_cost_usd": round(units * analysis.unit_cost_usd, 2),
+    }
+
+    diffs = [
+        ExpectationDiff(
+            field="projected_days_of_cover",
+            expected=round(expectation.expected_days_of_cover, 2),
+            actual=round(projected_cover, 2),
+            tolerance=TOLERANCES["days_of_cover"],
+            within_tolerance=abs(projected_cover - expectation.expected_days_of_cover)
+            <= TOLERANCES["days_of_cover"],
+        )
+    ]
+
+    if report.blocking:
+        return ValidationReport(
+            verdict=ValidationVerdict.VIOLATION,
+            constraint_report=report,
+            expectation_diffs=diffs,
+            observed_state=observed,
+            findings=[v.message for v in report.blocking],
+            corrective_guidance=(
+                "The proposal breaks hard constraints and must not be queued for approval as "
+                "it stands: "
+                + "; ".join(f"[{v.code}] {v.remedy_hint or v.message}" for v in report.blocking)
+            ),
+        )
+
+    findings = [
+        f"Pre-flight: {units} units from {supplier_id} passes all "
+        f"{len(report.checks_run)} constraint checks. Position would move from "
+        f"{analysis.inventory_position_units} to {projected_position} units "
+        f"({projected_cover:.1f} days of cover), costing about "
+        f"${observed['estimated_cost_usd']:,.2f}."
+    ]
+    findings.extend(f"Warning [{w.code}]: {w.message}" for w in report.warnings)
+
+    return ValidationReport(
+        verdict=ValidationVerdict.PASS,
+        constraint_report=report,
+        expectation_diffs=diffs,
+        observed_state=observed,
+        findings=findings,
+        corrective_guidance="",
+    )
+
+
 def validate_no_action(
     session: Session, sku: str, node_id: str, expectation: ActionExpectation
 ) -> ValidationReport:
@@ -643,7 +731,20 @@ def validate_no_action(
     blocking: list[ConstraintViolation] = []
 
     stockout = analysis.projected_stockout_in_days
-    exposure = analysis.lead_time_days + analysis.review_period_days
+
+    # How long the node is genuinely exposed before stock can be replaced.
+    # That is the *fastest* supplier who could actually take an order, not
+    # the incumbent: a buyer with a one-day emergency source is not exposed
+    # for the incumbent's seven days. Using the incumbent here would condemn
+    # a correct "no further action" as a stockout risk.
+    fastest = session.execute(
+        select(SupplierProduct.lead_time_days)
+        .join(Supplier, Supplier.supplier_id == SupplierProduct.supplier_id)
+        .where(SupplierProduct.sku == sku, Supplier.status == "active")
+        .order_by(SupplierProduct.lead_time_days)
+    ).scalars().first()
+    lead = fastest if fastest is not None else analysis.lead_time_days
+    exposure = lead + analysis.review_period_days
 
     if stockout is not None and stockout < exposure:
         blocking.append(
@@ -652,9 +753,8 @@ def validate_no_action(
                 severity=Severity.BLOCK,
                 message=(
                     f"Taking no action leaves stock running out in {stockout} days, inside "
-                    f"the {exposure}-day replenishment exposure window "
-                    f"(lead time {analysis.lead_time_days} + review period "
-                    f"{analysis.review_period_days})."
+                    f"the {exposure}-day replenishment exposure window (fastest available "
+                    f"lead time {lead} + review period {analysis.review_period_days})."
                 ),
                 observed=stockout,
                 limit=exposure,

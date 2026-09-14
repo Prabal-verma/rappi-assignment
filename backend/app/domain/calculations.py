@@ -28,6 +28,7 @@ from app.db.models import (
     PurchaseOrderLine,
     SalesActual,
     SupplierProduct,
+    TransferOrder,
 )
 from app.domain import clock
 from app.domain.schemas import ReplenishmentAnalysis
@@ -169,6 +170,28 @@ def inbound_shipments(session: Session, sku: str, node_id: str) -> list[InboundS
                 supplier_id=po.supplier_id,
             )
         )
+
+    # Stock moving in from another node is inbound cover just as much as a
+    # purchase order is. Counting only POs makes a transfer look like it did
+    # nothing, which sends the agent back to buy stock it has already moved.
+    transfers = session.execute(
+        select(TransferOrder).where(
+            TransferOrder.sku == sku,
+            TransferOrder.to_node_id == node_id,
+            TransferOrder.status.in_(["draft", "in_transit"]),
+        )
+    ).scalars()
+    for transfer in transfers:
+        shipments.append(
+            InboundShipment(
+                po_id=transfer.to_id,
+                units=transfer.units,
+                eta=clock.today() + timedelta(days=transfer.transit_days),
+                status=f"transfer:{transfer.status}",
+                supplier_id=f"node:{transfer.from_node_id}",
+            )
+        )
+
     return sorted(shipments, key=lambda s: s.eta)
 
 

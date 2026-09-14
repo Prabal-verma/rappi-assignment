@@ -151,8 +151,7 @@ def get_demand_forecast(
             data={"sku": sku, "node_id": node_id, "days": [], "note": "No forward forecast."},
         )
     total = sum(r.forecast_units for r in rows)
-    generated = min(r.generated_at for r in rows)
-    age_days = (clock.now() - generated).days
+    age_days = clock.age_in_days(min(r.generated_at for r in rows))
     return ToolResult(
         ok=True,
         slot=EvidenceSlot.DEMAND,

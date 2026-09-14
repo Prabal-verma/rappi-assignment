@@ -184,13 +184,27 @@ class DeterministicClient:
     # -- helpers --------------------------------------------------------
 
     @staticmethod
-    def _expectation(analysis: dict, units: int, unit_cost: float) -> dict:
-        position = analysis.get("inventory_position_units", 0) + units
+    def _expectation(
+        analysis: dict,
+        position_delta: int,
+        unit_cost: float,
+        secured_units: int | None = None,
+    ) -> dict:
+        """Predict the post-action world.
+
+        `position_delta` is how much stock the action adds. `secured_units`
+        is what validation will read off the purchase order — for a new PO
+        they are the same, but amending an existing PO from 400 to 800 adds
+        400 units of cover while the order line reads 800. Conflating the
+        two makes every amendment look like drift.
+        """
+        position = analysis.get("inventory_position_units", 0) + position_delta
         daily = analysis.get("daily_demand_mean", 0) or 0
         cover = round(position / daily, 2) if daily > 0 else 0.0
+        secured = position_delta if secured_units is None else secured_units
         return {
-            "expected_units_secured": units,
-            "expected_spend_usd": round(units * unit_cost, 2),
+            "expected_units_secured": secured,
+            "expected_spend_usd": round(secured * unit_cost, 2),
             "expected_inventory_position_units": position,
             "expected_days_of_cover": cover,
             "expected_stockout_risk": "low" if cover >= 7 else "medium",
@@ -330,16 +344,53 @@ class DeterministicClient:
                 "risk_level": "low",
             }
 
+        transfer = next(
+            (
+                c
+                for c in (ev.get("find_stock_at_other_nodes") or {}).get("candidates", [])
+                if c.get("transfer_possible")
+            ),
+            None,
+        )
+
+        # Policy POL-SUPPLIER prefers a transfer over a second purchase order
+        # when it fully closes the gap: the stock is already paid for and it
+        # usually arrives sooner. Only worth it if it covers the whole
+        # residual — a partial transfer just relocates the problem.
+        if transfer and transfer["transferable_surplus_units"] >= net_req:
+            factors.append(
+                f"{transfer['node_id']} holds {transfer['transferable_surplus_units']} units "
+                f"above its own target, enough to cover the residual without buying."
+            )
+            return {
+                "decision_type": "modify",
+                "recommended_units": net_req,
+                "rationale": (
+                    f"The residual requirement of {net_req} units can be met without a purchase. "
+                    f"{transfer['node_id']} holds {transfer['transferable_surplus_units']} units "
+                    f"above its own target position, and policy prefers a transfer over a second "
+                    f"purchase order when it closes the gap — the stock is already paid for and "
+                    f"arrives in {transfer.get('estimated_transit_days', 1)} day(s), inside the "
+                    f"{stockout}-day runway."
+                ),
+                "key_factors": factors,
+                "proposed_actions": [
+                    {
+                        "action_type": "create_transfer_order",
+                        "sku": sku,
+                        "node_id": node_id,
+                        "from_node_id": transfer["node_id"],
+                        "units": net_req,
+                        "reason": "Covering the supplier shortfall from same-country surplus.",
+                    }
+                ],
+                "expectation": self._expectation(analysis, net_req, 0.0),
+                "confidence": 0.8,
+                "risk_level": "low",
+            }
+
         alternate = self._pick_supplier(ev, stockout)
         if alternate is None:
-            transfer = next(
-                (
-                    c
-                    for c in (ev.get("find_stock_at_other_nodes") or {}).get("candidates", [])
-                    if c.get("transfer_possible")
-                ),
-                None,
-            )
             if transfer:
                 units = min(net_req, transfer["transferable_surplus_units"])
                 return {
@@ -478,7 +529,11 @@ class DeterministicClient:
 
         amendable = next((p for p in open_pos if p.get("status") in {"submitted", "confirmed", "partially_confirmed"}), None)
         if amendable:
-            new_units = amendable.get("ordered_units", 0) + net_req
+            # Add the *rounded* requirement, not the raw one: the amended
+            # total still has to be a whole number of cases, and a supplier
+            # cannot ship 749 units of a 20-pack.
+            increment = analysis.get("recommended_order_rounded") or net_req
+            new_units = amendable.get("ordered_units", 0) + increment
             promo_caveat = (
                 " but partly promotional, so it is not extrapolated at full strength" if live else ""
             )
@@ -503,7 +558,9 @@ class DeterministicClient:
                         "reason": "Covering confirmed demand uplift on the existing order.",
                     }
                 ],
-                "expectation": self._expectation(analysis, net_req, unit_cost),
+                "expectation": self._expectation(
+                    analysis, increment, unit_cost, secured_units=new_units
+                ),
                 "confidence": 0.75,
                 "risk_level": "medium",
             }
